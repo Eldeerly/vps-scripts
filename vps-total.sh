@@ -50,6 +50,18 @@ validate_ip() {
     return 1
 }
 
+validate_pubkey() {
+    local key="${1:-}"
+    case "$key" in
+        ssh-*|ecdsa-*|sk-*|ed25519-*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 get_ssh_port() {
     local port
     port=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | head -n 1)
@@ -118,7 +130,7 @@ hardening() {
             for _k in "${_keys[@]}"; do
                 _k="$(echo "$_k" | xargs)"
                 [ -z "$_k" ] && continue
-                if [[ "$_k" =~ ^(ssh|ecdsa|sk-|ed25519)[- ] ]]; then
+                if validate_pubkey "$_k"; then
                     grep -qF "$_k" /root/.ssh/authorized_keys 2>/dev/null || echo "$_k" >> /root/.ssh/authorized_keys
                 else
                     echo "警告: 忽略无效公钥: $_k"
@@ -305,7 +317,7 @@ add_pubkey_disable_pass() {
         echo -e "${RED}未输入公钥，操作取消。${NC}"
         return
     fi
-    if ! [[ "$PUBKEY" =~ ^(ssh|ecdsa|sk-|ed25519)[- ] ]]; then
+    if ! validate_pubkey "$PUBKEY"; then
         echo -e "${RED}公钥格式无效，操作取消。${NC}"
         return
     fi
@@ -560,7 +572,6 @@ check_A_success() {
         A_PORT="${mapping%%:*}"
         B_PORT="${mapping##*:}"
 
-        # 兼容 iptables-save 中可能省略同端口后缀的情况
         if echo "$nat_rules" | grep -qE -- "-A PREROUTING -p $PROTO -m $PROTO --dport $A_PORT -j DNAT --to-destination $B_IP(:$B_PORT)?"; then
             echo -e "${GREEN}[通过] PREROUTING 规则正常: $A_PORT -> $B_IP:$B_PORT${NC}"
         else
