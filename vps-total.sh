@@ -796,7 +796,7 @@ check_B_success() {
             if ss -tlnp 2>/dev/null | grep -q ":$port "; then
                 echo -e "${GREEN}[通过] TCP 端口 $port 处于监听状态${NC}"
             else
-                echo -e "${YELLOW}[提示] TCP 端口 $port 当前未监听，请确认后端服务已启动${NC}"
+                echo -e "${YELLOW}[提示] TCP 端口 $port ���前未监听，请确认后端服务已启动${NC}"
             fi
         else
             if ss -ulnp 2>/dev/null | grep -q ":$port "; then
