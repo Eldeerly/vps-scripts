@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  VPS 综合管理脚本 (加固 + 端口转发) 生产就绪终版
+#  VPS 综合管理脚本 (系统加固 + DNAT 端口转发) 修复增强版
 #  用法: bash vps-total.sh
 # ============================================================
 
@@ -11,6 +11,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -76,16 +77,39 @@ ufw_available() {
     command -v ufw >/dev/null 2>&1
 }
 
-ufw_delete_all_matching() {
-    local rule_pattern="$1"
+# 精确删除指定端口的 UFW 规则 (倒序删除，防止编号变动)
+ufw_delete_port_rules() {
+    local port="$1"
+    local proto="${2:-}"
     local rules_to_delete
-    rules_to_delete=$(ufw status numbered 2>/dev/null | grep -E "$rule_pattern" | awk -F'[][]' '{print $2}' | grep -E '^[0-9]+$' | sort -rn || true)
-    
+    if [ -n "$proto" ]; then
+        rules_to_delete=$(ufw status numbered 2>/dev/null | grep -E "^\\[ *[0-9]+\\] +$port/$proto " | awk -F'[][]' '{print $2}' | grep -E '^[0-9]+$' | sort -rn || true)
+    else
+        rules_to_delete=$(ufw status numbered 2>/dev/null | grep -E "^\\[ *[0-9]+\\] +$port(/| )" | awk -F'[][]' '{print $2}' | grep -E '^[0-9]+$' | sort -rn || true)
+    fi
+
     if [ -n "$rules_to_delete" ]; then
         for r_num in $rules_to_delete; do
             ufw --force delete "$r_num" >/dev/null 2>&1 || true
         done
     fi
+}
+
+# 安全启用 UFW，防止锁死 SSH
+safe_enable_ufw() {
+    local ssh_p
+    ssh_p=$(get_ssh_port)
+    ufw allow "$ssh_p/tcp" comment 'SSH-safety' >/dev/null 2>&1 || true
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        local curr_ip
+        curr_ip=$(echo "$SSH_CONNECTION" | awk '{print $1}')
+        if validate_ip "$curr_ip"; then
+            ufw allow from "$curr_ip" to any port "$ssh_p" proto tcp comment 'current-ssh-safety' >/dev/null 2>&1 || true
+        fi
+    fi
+    ufw default deny incoming >/dev/null 2>&1 || true
+    ufw default allow outgoing >/dev/null 2>&1 || true
+    ufw --force enable
 }
 
 # ============================================================
@@ -152,7 +176,7 @@ hardening() {
         sed -i -E '/^[[:space:]]*#?[[:space:]]*Port[[:space:]]+/d' "$SSHD"
         printf 'Port %s\n' "$NEWPORT" >> "$SSHD"
 
-        # drop-in 目录优先写入权威配置
+        # drop-in 目录写入权威配置
         if [ -d /etc/ssh/sshd_config.d ]; then
             cat > /etc/ssh/sshd_config.d/99-hardening.conf <<EOF
 Port $NEWPORT
@@ -192,13 +216,14 @@ EOF
         ufw default deny incoming 2>/dev/null || true
         ufw default allow outgoing 2>/dev/null || true
 
-        ufw_delete_all_matching "ALLOW[[:space:]]+[0-9]+/tcp"
+        # 清理旧 SSH 端口规则
+        ufw_delete_port_rules "$NEWPORT" "tcp"
 
         if [ -n "$SSH_WHITELIST" ]; then
             for _ip in $SSH_WHITELIST; do
                 if validate_ip "$_ip"; then
                     if ! ufw status | grep -q "ALLOW.*$_ip.*$NEWPORT/tcp"; then
-                        ufw allow from "$_ip" to any port "$NEWPORT" proto tcp
+                        ufw allow from "$_ip" to any port "$NEWPORT" proto tcp comment "ssh-whitelist-$_ip"
                     fi
                 else
                     echo "警告: 无效白名单 IP 忽略: $_ip"
@@ -263,9 +288,9 @@ check_hardening() {
     SSHD_PORT=$(get_ssh_port)
     echo "当前 SSH 端口: $SSHD_PORT"
     if ss -tlnp 2>/dev/null | grep -q ":22 "; then
-        echo -e "${RED}[失败]${NC} 22端口仍在监听"
+        echo -e "${RED}[失败]${NC} 22 端口仍在监听"
     else
-        echo -e "${GREEN}[通过]${NC} 22端口未监听"
+        echo -e "${GREEN}[通过]${NC} 22 端口未监听"
     fi
     PASS_AUTH=$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2}' | head -n 1)
     ROOT_LOGIN=$(sshd -T 2>/dev/null | awk '/^permitrootlogin /{print $2}' | head -n 1)
@@ -331,31 +356,38 @@ add_pubkey_disable_pass() {
     fi
     chmod 600 /root/.ssh/authorized_keys
 
+    local CURRENT_PORT
+    CURRENT_PORT=$(get_ssh_port)
+
     SSHD=/etc/ssh/sshd_config
     [ -f "$SSHD" ] && cp "$SSHD" "$SSHD.bak.$(date +%F_%T)"
     
-    sed -i -E '/^[[:space:]]*#?[[:space:]]*(PubkeyAuthentication|PasswordAuthentication|PermitRootLogin|ChallengeResponseAuthentication|KbdInteractiveAuthentication)[[:space:]]+/d' "$SSHD"
+    sed -i -E '/^[[:space:]]*#?[[:space:]]*(PubkeyAuthentication|PasswordAuthentication|PermitRootLogin|ChallengeResponseAuthentication|KbdInteractiveAuthentication|UsePAM)[[:space:]]+/d' "$SSHD"
     cat >> "$SSHD" <<EOF
 PubkeyAuthentication yes
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 ChallengeResponseAuthentication no
 KbdInteractiveAuthentication no
+UsePAM yes
 EOF
 
+    # 保持原端口设置与 PAM，避免覆盖丢失 Port 配置
     if [ -d /etc/ssh/sshd_config.d ]; then
         cat > /etc/ssh/sshd_config.d/99-hardening.conf <<EOF
+Port $CURRENT_PORT
 PubkeyAuthentication yes
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 ChallengeResponseAuthentication no
 KbdInteractiveAuthentication no
+UsePAM yes
 EOF
     fi
 
     if sshd -t; then
         systemctl restart ssh 2>/dev/null || systemctl restart sshd
-        echo -e "${GREEN}密码登录已关闭，公钥认证已启用。${NC}"
+        echo -e "${GREEN}密码登录已关闭，公钥认证已启用。当前端口: $CURRENT_PORT${NC}"
         echo "请立即在新终端测试密钥登录，确保可连接。"
     else
         echo -e "${RED}SSH 配置测试失败，未重启服务，请检查配置文件。${NC}"
@@ -370,10 +402,10 @@ set_ssh_whitelist() {
         return
     fi
     if ! ufw status | grep -q "active"; then
-        echo -e "${YELLOW}警告：UFW 未启用。是否现在启用？(y/N)${NC}"
+        echo -e "${YELLOW}警告：UFW 未启用。是否现在安全启用？(y/N)${NC}"
         read -r enable_ufw
         if [[ "$enable_ufw" =~ ^[Yy]$ ]]; then
-            ufw --force enable
+            safe_enable_ufw
         else
             echo "已取消。"
             return
@@ -389,7 +421,7 @@ set_ssh_whitelist() {
         return
     fi
 
-    echo -e "${RED}警告：此操作将删除 SSH 端口的全局放行规则，仅允许白名单访问。${NC}"
+    echo -e "${RED}警告：此操作将删除当前 SSH 端口的全局放行规则，仅允许白名单访问。${NC}"
     CURRENT_IP=$(echo "${SSH_CONNECTION:-}" | awk '{print $1}')
     echo -e "${YELLOW}当前连接 IP: ${CURRENT_IP:-未知}，将强制放行防失联。${NC}"
     read -p "确认继续？(y/N): " confirm
@@ -398,8 +430,8 @@ set_ssh_whitelist() {
         return
     fi
 
-    ufw_delete_all_matching "ALLOW[[:space:]]+[0-9]+/tcp"
-    ufw_delete_all_matching "ALLOW[[:space:]]+$SSH_PORT([[:space:]]|$)"
+    # 清理该 SSH 端口已有的全部规则（包括全局开放与旧白名单）
+    ufw_delete_port_rules "$SSH_PORT" "tcp"
 
     for ip in $IPS; do
         if validate_ip "$ip"; then
@@ -414,6 +446,7 @@ set_ssh_whitelist() {
         fi
     done
 
+    # 强制保障当前会话 IP 防失联
     if [ -n "$CURRENT_IP" ] && validate_ip "$CURRENT_IP"; then
         if ! ufw status | grep -q "ALLOW.*$CURRENT_IP.*$SSH_PORT/tcp"; then
             ufw allow from "$CURRENT_IP" to any port "$SSH_PORT" proto tcp comment 'current-ssh-session'
@@ -432,10 +465,10 @@ open_ports() {
         return
     fi
     if ! ufw status | grep -q "active"; then
-        echo -e "${YELLOW}警告：UFW 未启用。是否现在启用？(y/N)${NC}"
+        echo -e "${YELLOW}警告：UFW 未启用。是否现在安全启用？(y/N)${NC}"
         read -r enable_ufw
         if [[ "$enable_ufw" =~ ^[Yy]$ ]]; then
-            ufw --force enable
+            safe_enable_ufw
         else
             echo "已取消。"
             return
@@ -472,6 +505,8 @@ close_ports() {
         echo -e "${YELLOW}警告：UFW 未启用。${NC}"
         return
     fi
+    local SSH_PORT
+    SSH_PORT=$(get_ssh_port)
     echo "当前 UFW 规则:"
     ufw status numbered
     echo -e "请输入要删除的规则编号（多个用空格分隔，倒序输入更佳），或输入 0 取消："
@@ -483,7 +518,12 @@ close_ports() {
     echo -e "${YELLOW}将要删除以下规则：${NC}"
     for num in $RULES; do
         if [[ "$num" =~ ^[0-9]+$ ]]; then
-            ufw status numbered | grep -E "^\[ *$num\]" || true
+            local rule_line
+            rule_line=$(ufw status numbered | grep -E "^\[ *$num\]" || true)
+            echo "$rule_line"
+            if echo "$rule_line" | grep -q "$SSH_PORT"; then
+                echo -e "${RED}[警示] 编号 $num 疑似包含当前 SSH 端口 ($SSH_PORT)，误删可能导致 SSH 失去连接！${NC}"
+            fi
         fi
     done
     read -p "确认删除？(y/N): " confirm
@@ -654,10 +694,18 @@ configure_A() {
     iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
     iptables -I FORWARD 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
+    # 深度清理该 A_PORT 上已存在的所有旧 PREROUTING 规则，避免旧规则拦截覆盖
     for mapping in "${MAPPINGS[@]}"; do
         A_PORT="${mapping%%:*}"
         B_PORT="${mapping##*:}"
-        iptables -t nat -D PREROUTING -p "$PROTO" --dport "$A_PORT" -j DNAT --to-destination "$B_IP:$B_PORT" 2>/dev/null || true
+
+        while true; do
+            local rule_num
+            rule_num=$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | grep -E "dpt:$A_PORT( |$)" | awk '{print $1}' | head -n 1)
+            [ -z "$rule_num" ] && break
+            iptables -t nat -D PREROUTING "$rule_num" 2>/dev/null || break
+        done
+
         iptables -t nat -D POSTROUTING -p "$PROTO" -d "$B_IP" --dport "$B_PORT" -j MASQUERADE 2>/dev/null || true
         iptables -D FORWARD -p "$PROTO" -d "$B_IP" --dport "$B_PORT" -j ACCEPT 2>/dev/null || true
     done
@@ -796,7 +844,7 @@ check_B_success() {
             if ss -tlnp 2>/dev/null | grep -q ":$port "; then
                 echo -e "${GREEN}[通过] TCP 端口 $port 处于监听状态${NC}"
             else
-                echo -e "${YELLOW}[提示] TCP 端口 $port ���前未监听，请确认后端服务已启动${NC}"
+                echo -e "${YELLOW}[提示] TCP 端口 $port 当前未监听，请确认后端服务已启动${NC}"
             fi
         else
             if ss -ulnp 2>/dev/null | grep -q ":$port "; then
@@ -877,14 +925,50 @@ check_forwarding_effectiveness() {
     fi
 }
 
+delete_forwarding_rule() {
+    echo -e "${YELLOW}===== 删除指定端口转发规则 =====${NC}"
+    local DNAT_LINES
+    DNAT_LINES=$(iptables-save -t nat | grep -- "-A PREROUTING .* -j DNAT" || true)
+    if [ -z "$DNAT_LINES" ]; then
+        echo -e "${YELLOW}当前未检测到任何 DNAT 转发规则。${NC}"
+        return
+    fi
+    echo "当前正在生效的 DNAT 规则："
+    iptables -t nat -L PREROUTING --line-numbers -n -v | grep -E "DNAT|Chain"
+    echo ""
+    read -p "请输入要删除的 A 机监听端口 (例如 2054): " DEL_PORT
+    if ! validate_port "$DEL_PORT"; then
+        echo -e "${RED}无效端口号: $DEL_PORT${NC}"
+        return
+    fi
+    local count=0
+    while true; do
+        local rule_num
+        rule_num=$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | grep -E "dpt:$DEL_PORT( |$)" | awk '{print $1}' | head -n 1)
+        [ -z "$rule_num" ] && break
+        iptables -t nat -D PREROUTING "$rule_num" 2>/dev/null || break
+        count=$((count + 1))
+    done
+    if [ "$count" -gt 0 ]; then
+        echo "持久化保存 iptables 规则..."
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+        systemctl restart netfilter-persistent.service 2>/dev/null || true
+        echo -e "${GREEN}[成功] 已清除 A 机端口 $DEL_PORT 的 $count 条 PREROUTING 规则并已持久化。${NC}"
+    else
+        echo -e "${YELLOW}未找到端口 $DEL_PORT 对应的 PREROUTING 规则。${NC}"
+    fi
+}
+
 # ---------- 主菜单 ----------
 while true; do
     clear
     echo -e "${BLUE}========================================${NC}"
-    echo -e "${BLUE}         VPS 综合管理脚本 (终版)         ${NC}"
+    echo -e "${BLUE}    VPS 综合管理脚本 (加固 + 转发 修复版) ${NC}"
     echo -e "${BLUE}========================================${NC}"
     echo -e "  [系统加固]"
-    echo -e "  1. 系统加固"
+    echo -e "  1. 系统加固 (一键更新+端口+密钥+Fail2ban)"
     echo -e "  2. 检查加固状态"
     echo -e "  3. 添加公钥并关闭密码登录"
     echo -e "  4. 设置 SSH IP 白名单"
@@ -894,10 +978,14 @@ while true; do
     echo -e "  7. 配置 DNAT 转发节点 (A 机)"
     echo -e "  8. 配置目标服务节点放行 (B 机)"
     echo -e "  9. 检查转发是否生效"
+    echo -e "  10. 删除指定端口转发规则"
     echo -e "  0. 退出"
     echo -e "${BLUE}========================================${NC}"
     echo -ne "请输入数字选择操作: "
-    read -r choice
+    if ! read -r choice; then
+        echo -e "\n${GREEN}检测到输入流关闭，退出脚本。${NC}"
+        exit 0
+    fi
     case "${choice:-}" in
         1) hardening ;;
         2) check_hardening ;;
@@ -908,8 +996,9 @@ while true; do
         7) configure_A ;;
         8) configure_B ;;
         9) check_forwarding_effectiveness ;;
+        10) delete_forwarding_rule ;;
         0) echo -e "${GREEN}退出脚本。${NC}"; exit 0 ;;
         *) echo -e "${RED}无效选择，请重新输入。${NC}"; sleep 1; continue ;;
     esac
-    read -p "按回车键返回菜单..."
+    read -rp "按回车键返回菜单..." || exit 0
 done
