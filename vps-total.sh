@@ -86,14 +86,24 @@ ufw_available() {
 }
 
 # 精确删除指定端口的 UFW 规则 (倒序删除，防止编号变动)
+# 精确删除指定端口的 UFW 规则 (显式清理全网规则 + 倒序删除具体规则)
 ufw_delete_port_rules() {
     local port="$1"
     local proto="${2:-}"
+
+    # 1. 显式清除全网放行 (Anywhere) 规则 (双栈 IPv4/IPv6 均能彻底清除)
+    if [ -n "$proto" ]; then
+        ufw delete allow "$port/$proto" >/dev/null 2>&1 || true
+    fi
+    ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
+    ufw delete allow "$port" >/dev/null 2>&1 || true
+
+    # 2. 倒序删除剩余包含该端口的所有规则 (覆盖白名单规则、自定义注释规则等)
     local rules_to_delete
     if [ -n "$proto" ]; then
-        rules_to_delete=$(ufw status numbered 2>/dev/null | grep -E "^\\[ *[0-9]+\\] +$port/$proto " | awk -F'[][]' '{print $2}' | grep -E '^[0-9]+$' | sort -rn || true)
+        rules_to_delete=$(ufw status numbered 2>/dev/null | grep -E "^\[ *[0-9]+\] +$port(/$proto| )" | awk -F'[][]' '{print $2}' | grep -E '^[0-9]+$' | sort -rn || true)
     else
-        rules_to_delete=$(ufw status numbered 2>/dev/null | grep -E "^\\[ *[0-9]+\\] +$port(/| )" | awk -F'[][]' '{print $2}' | grep -E '^[0-9]+$' | sort -rn || true)
+        rules_to_delete=$(ufw status numbered 2>/dev/null | grep -E "^\[ *[0-9]+\] +$port(/| )" | awk -F'[][]' '{print $2}' | grep -E '^[0-9]+$' | sort -rn || true)
     fi
 
     if [ -n "$rules_to_delete" ]; then
@@ -103,16 +113,24 @@ ufw_delete_port_rules() {
     fi
 }
 
-# 安全启用 UFW，防止锁死 SSH
+# 安全启用 UFW，防止锁死 SSH (杜绝反向注入全网放行)
 safe_enable_ufw() {
     local ssh_p
     ssh_p=$(get_ssh_port)
-    ufw allow "$ssh_p/tcp" comment 'SSH-safety' >/dev/null 2>&1 || true
+    local curr_ip=""
     if [ -n "${SSH_CONNECTION:-}" ]; then
-        local curr_ip
         curr_ip=$(echo "$SSH_CONNECTION" | awk '{print $1}')
-        if validate_ip "$curr_ip"; then
+    fi
+
+    # 优先放行当前管理终端 IP，杜绝盲目放行 Anywhere 导致穿透白名单
+    if [ -n "$curr_ip" ] && validate_ip "$curr_ip"; then
+        if ! ufw status 2>/dev/null | grep -qE "ALLOW.*$curr_ip.*$ssh_p"; then
             ufw allow from "$curr_ip" to any port "$ssh_p" proto tcp comment 'current-ssh-safety' >/dev/null 2>&1 || true
+        fi
+    else
+        # 仅在无管理会话 IP 且没有任何该端口规则时，才兜底放行
+        if ! ufw status 2>/dev/null | grep -qE "$ssh_p(/tcp| )"; then
+            ufw allow "$ssh_p/tcp" comment 'SSH-safety' >/dev/null 2>&1 || true
         fi
     fi
     ufw default deny incoming >/dev/null 2>&1 || true
@@ -421,7 +439,7 @@ EOF
 }
 
 set_ssh_whitelist() {
-    echo -e "${YELLOW}===== 设置 SSH IP 白名单 =====${NC}"
+    echo -e "${YELLOW}===== 设置 SSH 访问控制 (白名单 / 全网开放) =====${NC}"
     if ! ufw_available; then
         echo -e "${RED}错误：UFW 未安装。${NC}"
         return 1
@@ -441,16 +459,33 @@ set_ssh_whitelist() {
     SSH_PORT=$(get_ssh_port)
     echo -e "当前 SSH 端口: $SSH_PORT"
     echo -e "请输入允许访问 SSH 的白名单 IP（多个用空格分隔）："
+    echo -e "  - 输入一个或多个 IP：仅放行这些 IP（白名单模式）"
+    echo -e "  - 输入 ${CYAN}all${NC} 或 ${CYAN}any${NC}：恢复全网开放该端口 (关闭白名单)"
     read -r IPS
     if [ -z "$IPS" ]; then
-        echo -e "${RED}未输入 IP，操作取消。${NC}"
+        echo -e "${RED}未输入任何内容，操作取消。${NC}"
         return 1
     fi
 
     local CURRENT_IP
     CURRENT_IP=$(echo "${SSH_CONNECTION:-}" | awk '{print $1}')
+
+    # 支持一键切换回全网开放
+    if [ "$IPS" = "all" ] || [ "$IPS" = "any" ]; then
+        read -p "确认清除当前白名单，恢复全网开放 SSH 端口 $SSH_PORT？(y/N): " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "已取消。"
+            return 0
+        fi
+        ufw_delete_port_rules "$SSH_PORT" "tcp"
+        ufw allow "$SSH_PORT/tcp" comment 'SSH'
+        ufw reload
+        echo -e "${GREEN}已恢复全网开放 SSH 端口 $SSH_PORT。${NC}"
+        return 0
+    fi
+
     echo -e "${YELLOW}当前连接 IP: ${CURRENT_IP:-未知}，将强制放行防失联。${NC}"
-    read -p "确认继续覆盖该端口的白名单规则？(y/N): " confirm
+    read -p "确认清空旧规则并应用新的白名单？(y/N): " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "已取消。"
         return 0
@@ -464,6 +499,8 @@ set_ssh_whitelist() {
                 ufw allow from "$ip" to any port "$SSH_PORT" proto tcp comment "ssh-whitelist-$ip"
                 echo "已添加白名单 IP: $ip"
             fi
+        else
+            echo -e "${YELLOW}忽略无效 IP: $ip${NC}"
         fi
     done
 
@@ -475,7 +512,7 @@ set_ssh_whitelist() {
     fi
 
     ufw reload
-    echo -e "${GREEN}SSH 白名单设置完成。${NC}"
+    echo -e "${GREEN}SSH 白名单设置完成，旧的全网放行规则已清除。${NC}"
 }
 
 open_ports() {
@@ -898,6 +935,12 @@ configure_landing() {
 
     if ufw_available && ufw status | grep -q "active"; then
         for p in "${valid_ports[@]}"; do
+            # 如果该业务端口此前存在全网放行 (Anywhere)，清理之以防止穿透击穿落地源站隐身
+            if ufw status 2>/dev/null | grep -E "^\[ *[0-9]+\] +$p(/$PROTO| ) " | grep -q "Anywhere"; then
+                echo -e "${YELLOW}[检测] 业务端口 $p 存在全网放行 (Anywhere)，正在清理以保障仅中转机可达...${NC}"
+                ufw delete allow "$p/$PROTO" >/dev/null 2>&1 || true
+                ufw delete allow "$p" >/dev/null 2>&1 || true
+            fi
             if ! ufw status | grep -qE "ALLOW.*$RELAY_IP.*$p/$PROTO"; then
                 ufw allow from "$RELAY_IP" to any port "$p" proto "$PROTO" comment "from-relay-$RELAY_IP" || true
                 echo "UFW 已放行: $p/$PROTO 仅限来自 $RELAY_IP"
