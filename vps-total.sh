@@ -797,6 +797,51 @@ configure_relay() {
     check_relay_success "$B_IP" "$PROTO" "${MAPPINGS[@]}"
 }
 
+list_relay_rules() {
+    echo -e "${YELLOW}===== 当前生效的中转规则列表 =====${NC}"
+
+    # 检查 iptables 是否安装
+    if ! command -v iptables >/dev/null 2>&1; then
+        echo -e "${YELLOW}iptables 未安装，无法查看中转规则。${NC}"
+        return 0
+    fi
+
+    local dnat_rules
+    dnat_rules=$(iptables -t nat -S PREROUTING | grep -- '-j DNAT' || true)
+    if [ -z "$dnat_rules" ]; then
+        echo -e "${YELLOW}当前没有配置任何 DNAT 中转规则。${NC}"
+        return 0
+    fi
+
+    echo -e "${GREEN}----- PREROUTING (DNAT) 规则 -----${NC}"
+    echo "$dnat_rules" | while IFS= read -r rule; do
+        local proto=$(echo "$rule" | sed -n 's/.*-p \([a-z0-9]*\).*/\1/p')
+        local aport=$(echo "$rule" | sed -n 's/.*--dport \([0-9]*\).*/\1/p')
+        local dest=$(echo "$rule" | sed -n 's/.*--to-destination \([0-9.]*:[0-9]*\).*/\1/p')
+        [ -n "$proto" ] && [ -n "$aport" ] && [ -n "$dest" ] && echo "  $proto 本机端口 $aport -> $dest"
+    done
+
+    echo -e "${GREEN}----- POSTROUTING (MASQUERADE) 规则 -----${NC}"
+    local masq_rules=$(iptables -t nat -S POSTROUTING | grep -- '-j MASQUERADE' || true)
+    if [ -n "$masq_rules" ]; then
+        echo "$masq_rules" | while IFS= read -r rule; do
+            echo "  $rule"
+        done
+    else
+        echo "  无"
+    fi
+
+    echo -e "${GREEN}----- FORWARD (ACCEPT) 规则 -----${NC}"
+    local fwd_rules=$(iptables -S FORWARD | grep -- '-j ACCEPT' | grep -v 'ctstate RELATED,ESTABLISHED' || true)
+    if [ -n "$fwd_rules" ]; then
+        echo "$fwd_rules" | while IFS= read -r rule; do
+            echo "  $rule"
+        done
+    else
+        echo "  无"
+    fi
+}
+
 check_relay_success() {
     local B_IP=$1 PROTO=$2
     shift 2
@@ -1079,6 +1124,28 @@ delete_landing_whitelist() {
         done
         save_iptables_rules
         echo -e "${GREEN}已清理 iptables INPUT 中来自 $RELAY_IP 的规则。${NC}"
+    fi
+}
+
+list_landing_rules() {
+    echo -e "${YELLOW}===== 当前落地入站放行规则 (仅限特定来源 IP) =====${NC}"
+    if ufw_available && ufw status | grep -q "active"; then
+        echo "UFW 状态: 已激活"
+        echo "以下为所有包含来源 IP 的放行规则 (排除 Anywhere):"
+        local specific_rules=$(ufw status numbered 2>/dev/null | grep -E "ALLOW" | grep -v "Anywhere" || true)
+        if [ -n "$specific_rules" ]; then
+            echo "$specific_rules" | sed 's/^/  /'
+        else
+            echo "  无特定来源 IP 的放行规则"
+        fi
+    else
+        echo "UFW 未激活或不可用，检查 iptables INPUT 链中带有来源 IP 的 ACCEPT 规则:"
+        local input_rules=$(iptables -L INPUT -n --line-numbers 2>/dev/null | grep -E "ACCEPT" | grep -v "0.0.0.0/0" | grep -v "::/0" || true)
+        if [ -n "$input_rules" ]; then
+            echo "$input_rules" | sed 's/^/  /'
+        else
+            echo "  无特定来源 IP 的放行规则"
+        fi
     fi
 }
 
@@ -1530,19 +1597,21 @@ while true; do
     echo -e ""
     echo -e "  ${CYAN}【中转节点功能】 (流量转发专用)${NC}"
     echo -e "  7. 配置 DNAT 端口转发规则"
-    echo -e "  8. 检查本机中转规则与目标链路可用性"
-    echo -e "  9. 删除指定端口转发规则 (原子化联动清理)"
+    echo -e "  8. 查看当前中转规则"
+    echo -e "  9. 检查本机中转规则与目标链路可用性"
+    echo -e "  10. 删除指定端口转发规则 (原子化联动清理)"
     echo -e ""
     echo -e "  ${CYAN}【落地节点功能】 (业务服务与源站安全)${NC}"
-    echo -e "  10. 仅放行中转机访问本机业务端口 (源站隐身)"
-    echo -e "  11. 移除针对指定中转机的放行规则"
+    echo -e "  11. 仅放行中转机访问本机业务端口 (源站隐身)"
+    echo -e "  12. 移除针对指定中转机的放行规则"
+    echo -e "  13. 查看当前落地放行规则"
     echo -e ""
     echo -e "  ${CYAN}【系统与网络优化】${NC}"
-    echo -e "  12. BBR 拥塞控制与网络深度调优 (集成 tcpfit)"
+    echo -e "  14. BBR 拥塞控制与网络深度调优 (集成 tcpfit)"
     echo -e ""
     echo -e "  ${CYAN}【配置备份与灾备】${NC}"
-    echo -e "  13. 创建当前系统配置备份 (包含SSH/UFW/中转/内核参数)"
-    echo -e "  14. 查看并回退/还原历史备份配置"
+    echo -e "  15. 创建当前系统配置备份 (包含SSH/UFW/中转/内核参数)"
+    echo -e "  16. 查看并回退/还原历史备份配置"
     echo -e "  0.  退出脚本"
     echo -e "${BLUE}============================================================${NC}"
     echo -ne "请输入数字选择操作: "
@@ -1558,13 +1627,15 @@ while true; do
         5) open_ports ;;
         6) close_ports ;;
         7) configure_relay ;;
-        8) check_forwarding_effectiveness ;;
-        9) delete_forwarding_rule ;;
-        10) configure_landing ;;
-        11) delete_landing_whitelist ;;
-        12) network_tuning_menu ;;
-        13) backup_config ;;
-        14) restore_config ;;
+        8) list_relay_rules ;;
+        9) check_forwarding_effectiveness ;;
+        10) delete_forwarding_rule ;;
+        11) configure_landing ;;
+        12) delete_landing_whitelist ;;
+        13) list_landing_rules ;;
+        14) network_tuning_menu ;;
+        15) backup_config ;;
+        16) restore_config ;;
         0) echo -e "${GREEN}退出脚本。${NC}"; exit 0 ;;
         *) echo -e "${RED}无效选择，请重新输入。${NC}"; sleep 1; continue ;;
     esac
