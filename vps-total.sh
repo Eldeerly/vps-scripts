@@ -1630,8 +1630,13 @@ install_shortcut() {
 # ============================================================
 
 if [ "$SCRIPT_PATH" != "/usr/local/bin/vps" ]; then
-    install_shortcut
-    exit $?
+    if install_shortcut; then
+        echo -e "${GREEN}快捷命令安装完成，正在进入主菜单...${NC}"
+        # 安装成功后继续执行主菜单，不退出
+    else
+        echo -e "${RED}快捷命令安装失败，退出。${NC}"
+        exit 1
+    fi
 fi
 
 # ============================================================
