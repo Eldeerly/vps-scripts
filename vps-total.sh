@@ -29,6 +29,8 @@ fi
 
 # 获取脚本自身的绝对路径（用于快捷安装）
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "")"
+# 远程脚本地址（用于管道执行时下载安装）
+REMOTE_SCRIPT_URL="https://raw.githubusercontent.com/Eldeerly/vps-scripts/main/vps-total.sh"
 
 # ============================================================
 # 通用校验与辅助工具函数
@@ -1587,24 +1589,38 @@ EOF
 
 install_shortcut() {
     echo -e "${YELLOW}===== 安装/更新 vps 快捷命令 =====${NC}"
-    
-    if [ -z "$SCRIPT_PATH" ] || [ ! -f "$SCRIPT_PATH" ]; then
-        echo -e "${RED}错误：无法定位当前脚本文件，可能通过管道执行。请先保存脚本到本地文件后再执行本功能。${NC}"
-        return 1
-    fi
-
     local target="/usr/local/bin/vps"
     if [ ! -d /usr/local/bin ]; then
         mkdir -p /usr/local/bin
     fi
 
-    # 复制脚本到目标位置
-    if cp "$SCRIPT_PATH" "$target"; then
-        chmod +x "$target"
-        echo -e "${GREEN}[成功] 已将脚本安装到 ${target}${NC}"
-        echo -e "现在您可以直接在终端输入 ${CYAN}vps${NC} 启动本管理脚本。"
+    # 情况1：本地脚本文件有效，直接复制
+    if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
+        if cp "$SCRIPT_PATH" "$target"; then
+            chmod +x "$target"
+            echo -e "${GREEN}[成功] 已将脚本安装到 ${target}${NC}"
+            echo -e "现在您可以直接在终端输入 ${CYAN}vps${NC} 启动本管理脚本。"
+            return 0
+        else
+            echo -e "${RED}[失败] 复制文件到 ${target} 失败，请检查权限。${NC}"
+            return 1
+        fi
+    fi
+
+    # 情况2：本地文件不可用（如管道执行），尝试远程下载
+    echo -e "${YELLOW}本地脚本路径不可用，尝试从远程地址下载...${NC}"
+    if [ -n "$REMOTE_SCRIPT_URL" ] && command -v curl >/dev/null 2>&1; then
+        if curl -fsSL "$REMOTE_SCRIPT_URL" -o "$target"; then
+            chmod +x "$target"
+            echo -e "${GREEN}[成功] 已下载并安装到 ${target}${NC}"
+            echo -e "现在您可以直接在终端输入 ${CYAN}vps${NC} 启动本管理脚本。"
+            return 0
+        else
+            echo -e "${RED}[失败] 远程下载失败，请手动下载脚本保存到 ${target} 并赋予执行权限。${NC}"
+            return 1
+        fi
     else
-        echo -e "${RED}[失败] 复制文件到 ${target} 失败，请检查权限。${NC}"
+        echo -e "${RED}[失败] 无法定位脚本文件且未配置远程下载地址或缺少 curl，请手动安装。${NC}"
         return 1
     fi
 }
