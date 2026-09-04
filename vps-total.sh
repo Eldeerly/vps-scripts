@@ -349,7 +349,7 @@ check_hardening() {
         if ufw status | grep -q "active"; then
             echo -e "${GREEN}[通过]${NC} UFW 防火墙处于激活状态"
             echo "--- 当前 UFW 规则汇总 ---"
-            ufw status numbered | grep -E '^[0-9]|^Status|^To' | sed 's/^/  /'
+            ufw status numbered 2>/dev/null | sed 's/^/  /'
         else
             echo -e "${YELLOW}[提示]${NC} UFW 防火墙未激活 (若为纯中转机属正常现象)"
         fi
