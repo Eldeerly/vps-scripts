@@ -216,10 +216,20 @@ save_iptables_rules() {
 hardening() {
     echo -e "${YELLOW}===== 开始执行系统安全加固 =====${NC}"
 
+    local CURRENT_PORT
+    CURRENT_PORT=$(get_ssh_port)
+    local DEFAULT_PORT=44644
+
+    if [ "$CURRENT_PORT" != "22" ]; then
+        echo -e "${YELLOW}[提示] 检测到本机当前 SSH 端口为非 22 标准端口 ($CURRENT_PORT)。${NC}"
+        echo -e "${YELLOW}若本机为 NAT 端口转发机或服务商云控制台配置了指定端口，请务必保持当前端口以防外网失联！${NC}"
+        DEFAULT_PORT="$CURRENT_PORT"
+    fi
+
     local NEWPORT="${SSH_PORT:-}"
     if [ -z "$NEWPORT" ]; then
-        read -p "请输入新的 SSH 端口 (默认 44644): " NEWPORT
-        NEWPORT="${NEWPORT:-44644}"
+        read -p "请输入新的 SSH 端口 (默认 $DEFAULT_PORT): " NEWPORT
+        NEWPORT="${NEWPORT:-$DEFAULT_PORT}"
     fi
     if ! validate_port "$NEWPORT"; then
         echo -e "${RED}错误: SSH 端口 $NEWPORT 无效，必须是 1-65535 的数字${NC}"
@@ -242,16 +252,14 @@ hardening() {
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive
         # 更新失败不中断脚本
-        apt-get update -qq 2>/dev/null || apt-get update || true
-
-        # 分开安装基础工具包，避免单个包名错误导致整个流程中断
+        apt-get update -qq 2>/dev/null || apt-get update || true        # 分开安装基础工具包，避免单个包名错误导致整个流程中断 (< /dev/null 防止抢占标准输入)
         for pkg in ca-certificates curl wget git htop net-tools traceroute ufw fail2ban unattended-upgrades; do
-            apt-get install -y "$pkg" >/dev/null 2>&1 || echo -e "${YELLOW}警告: 安装 $pkg 失败，继续执行...${NC}"
+            apt-get install -y "$pkg" < /dev/null >/dev/null 2>&1 || echo -e "${YELLOW}警告: 安装 $pkg 失败，继续执行...${NC}"
         done
 
         # 可选包 earlyoom 和 python3-systemd 可能存在缺失，单独处理
-        apt-get install -y earlyoom >/dev/null 2>&1 || echo -e "${YELLOW}警告: earlyoom 安装失败或不存在，跳过。${NC}"
-        apt-get install -y python3-systemd >/dev/null 2>&1 || echo -e "${YELLOW}警告: python3-systemd 安装失败或不存在，跳过。${NC}"
+        apt-get install -y earlyoom < /dev/null >/dev/null 2>&1 || echo -e "${YELLOW}警告: earlyoom 安装失败或不存在，跳过。${NC}"
+        apt-get install -y python3-systemd < /dev/null >/dev/null 2>&1 || echo -e "${YELLOW}警告: python3-systemd 安装失败或不存在，跳过。${NC}"
 
         # 询问是否安装最新内核（可能需要重启）
         ARCH=$(dpkg --print-architecture)
@@ -296,11 +304,13 @@ hardening() {
         printf 'Port %s\n' "$NEWPORT" >> "$SSHD"
 
         mkdir -p /etc/ssh/sshd_config.d
-        cat > /etc/ssh/sshd_config.d/99-hardening.conf <<EOF
+        # 移除旧的 99-hardening.conf 避免历史残留影响优先级
+        rm -f /etc/ssh/sshd_config.d/99-hardening.conf 2>/dev/null || true
+        cat > /etc/ssh/sshd_config.d/00-hardening.conf <<EOF
 Port $NEWPORT
 EOF
         if [ "$HAS_KEY" -eq 1 ]; then
-            cat >> /etc/ssh/sshd_config.d/99-hardening.conf <<EOF
+            cat >> /etc/ssh/sshd_config.d/00-hardening.conf <<EOF
 PubkeyAuthentication yes
 PasswordAuthentication no
 PermitRootLogin prohibit-password
@@ -308,6 +318,11 @@ ChallengeResponseAuthentication no
 KbdInteractiveAuthentication no
 UsePAM yes
 EOF
+            # 批量修正 /etc/ssh/sshd_config.d/ 下其他可能包含 PasswordAuthentication yes 的文件 (如 50-cloud-init.conf)
+            for _cfg in /etc/ssh/sshd_config.d/*.conf; do
+                [ "$_cfg" = "/etc/ssh/sshd_config.d/00-hardening.conf" ] && continue
+                [ -f "$_cfg" ] && sed -i -E 's/^[[:space:]]*PasswordAuthentication[[:space:]]+yes/PasswordAuthentication no/g' "$_cfg" 2>/dev/null || true
+            done
             sed -i -E '/^[[:space:]]*#?[[:space:]]*(PubkeyAuthentication|PasswordAuthentication|PermitRootLogin|ChallengeResponseAuthentication|KbdInteractiveAuthentication|UsePAM)[[:space:]]+/d' "$SSHD"
             cat >> "$SSHD" <<EOF
 PubkeyAuthentication yes
@@ -470,7 +485,8 @@ UsePAM yes
 EOF
 
     mkdir -p /etc/ssh/sshd_config.d
-    cat > /etc/ssh/sshd_config.d/99-hardening.conf <<EOF
+    rm -f /etc/ssh/sshd_config.d/99-hardening.conf 2>/dev/null || true
+    cat > /etc/ssh/sshd_config.d/00-hardening.conf <<EOF
 Port $CURRENT_PORT
 PubkeyAuthentication yes
 PasswordAuthentication no
@@ -479,6 +495,12 @@ ChallengeResponseAuthentication no
 KbdInteractiveAuthentication no
 UsePAM yes
 EOF
+
+    # 批量修正 /etc/ssh/sshd_config.d/ 下其他可能包含 PasswordAuthentication yes 的文件 (如 50-cloud-init.conf)
+    for _cfg in /etc/ssh/sshd_config.d/*.conf; do
+        [ "$_cfg" = "/etc/ssh/sshd_config.d/00-hardening.conf" ] && continue
+        [ -f "$_cfg" ] && sed -i -E 's/^[[:space:]]*PasswordAuthentication[[:space:]]+yes/PasswordAuthentication no/g' "$_cfg" 2>/dev/null || true
+    done
 
     if sshd -t; then
         systemctl restart ssh 2>/dev/null || systemctl restart sshd
