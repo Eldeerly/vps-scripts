@@ -1012,12 +1012,23 @@ delete_landing_whitelist() {
 # 模块四：网络吞吐优化 (BBR)
 # ============================================================
 
+run_tcpfit() {
+    local subcmd="${1:-}"
+    shift || true
+    if command -v tcpfit >/dev/null 2>&1; then
+        tcpfit ${subcmd:+"$subcmd"} "$@"
+    else
+        echo -e "${YELLOW}正在从官方源加载并执行 tcpfit...${NC}"
+        bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh) ${subcmd:+"$subcmd"} "$@"
+    fi
+}
+
 enable_bbr() {
-    echo -e "${YELLOW}===== 开启 BBR 拥塞控制与网络优化 =====${NC}"
+    echo -e "${YELLOW}===== 开启原生 BBR 拥塞控制 =====${NC}"
     local current_cc
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
     if [ "$current_cc" = "bbr" ] || [ "$current_cc" = "bbrv3" ]; then
-        echo -e "${GREEN}[通过] 当前已启用 $current_cc 拥塞控制算法${NC}"
+        echo -e "${GREEN}[通过] 当前系统已启用 $current_cc 拥塞控制算法${NC}"
         return 0
     fi
 
@@ -1030,10 +1041,72 @@ enable_bbr() {
     local new_cc
     new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
     if [ "$new_cc" = "bbr" ] || [ "$new_cc" = "bbrv3" ]; then
-        echo -e "${GREEN}[成功] BBR 拥塞控制已开启生效！${NC}"
+        echo -e "${GREEN}[成功] 原生 BBR 拥塞控制已开启生效！(算法: $new_cc)${NC}"
     else
         echo -e "${YELLOW}[提示] 当前内核未直接生效 BBR (当前: $new_cc)，可能需要升级内核或重启。${NC}"
     fi
+}
+
+network_tuning_menu() {
+    while true; do
+        local cc qdisc tf_status
+        cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+        qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+        if [ -f "/etc/sysctl.d/99-tcpfit.conf" ] || command -v tcpfit >/dev/null 2>&1; then
+            tf_status="${GREEN}已就绪 / 已调优${NC}"
+        else
+            tf_status="${YELLOW}未配置${NC}"
+        fi
+
+        echo -e ""
+        echo -e "${BLUE}============================================================${NC}"
+        echo -e "${BLUE}           系统与网络优化 (BBR & TCP 深度调优)            ${NC}"
+        echo -e "${BLUE}============================================================${NC}"
+        echo -e "  当前网络核心参数:"
+        echo -e "    - 拥塞控制算法 (CC):    ${GREEN}${cc}${NC}"
+        echo -e "    - 默认队列调度 (Qdisc): ${GREEN}${qdisc}${NC}"
+        echo -e "    - tcpfit 深度优化组件:  ${tf_status}"
+        echo -e "${BLUE}------------------------------------------------------------${NC}"
+        echo -e "  1. 开启原生 BBR (内置极速配置: fq + bbr，本地即时生效)"
+        echo -e "  2. 启动 tcpfit 深度优化向导 (推荐: 带宽实测+拐点整形+Initcwnd)"
+        echo -e "  3. 查看详细网络调优与健康状态 (tcpfit status)"
+        echo -e "  4. 回滚 tcpfit 调优配置 (恢复系统默认)"
+        echo -e "  0. 返回主菜单"
+        echo -e "${BLUE}============================================================${NC}"
+        read -rp "请输入数字选择操作 [0-4]: " opt
+        case "${opt:-}" in
+            1)
+                enable_bbr
+                ;;
+            2)
+                run_tcpfit
+                ;;
+            3)
+                if command -v tcpfit >/dev/null 2>&1 || [ -f "/etc/sysctl.d/99-tcpfit.conf" ]; then
+                    run_tcpfit status
+                else
+                    echo -e "${YELLOW}当前尚未安装 tcpfit，显示内核原生状态：${NC}"
+                    echo "拥塞控制算法: $(sysctl -n net.ipv4.tcp_congestion_control)"
+                    echo "可用算法列表: $(sysctl -n net.ipv4.tcp_available_congestion_control)"
+                    echo "队列调度规则: $(sysctl -n net.core.default_qdisc)"
+                fi
+                ;;
+            4)
+                echo -e "${YELLOW}正在执行配置回滚...${NC}"
+                run_tcpfit rollback
+                ;;
+            0|"")
+                break
+                ;;
+            *)
+                echo -e "${RED}无效选择，请重新输入。${NC}"
+                sleep 1
+                continue
+                ;;
+        esac
+        echo ""
+        read -rp "按回车键继续..." || break
+    done
 }
 
 # ============================================================
@@ -1063,7 +1136,7 @@ while true; do
     echo -e "  11. 移除针对指定中转机的放行规则"
     echo -e ""
     echo -e "  ${CYAN}【系统与网络优化】${NC}"
-    echo -e "  12. 开启 BBR 拥塞控制"
+    echo -e "  12. BBR 拥塞控制与网络深度调优 (集成 tcpfit)"
     echo -e "  0.  退出脚本"
     echo -e "${BLUE}============================================================${NC}"
     echo -ne "请输入数字选择操作: "
@@ -1083,7 +1156,7 @@ while true; do
         9) delete_forwarding_rule ;;
         10) configure_landing ;;
         11) delete_landing_whitelist ;;
-        12) enable_bbr ;;
+        12) network_tuning_menu ;;
         0) echo -e "${GREEN}退出脚本。${NC}"; exit 0 ;;
         *) echo -e "${RED}无效选择，请重新输入。${NC}"; sleep 1; continue ;;
     esac
