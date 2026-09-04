@@ -86,7 +86,6 @@ ufw_available() {
 }
 
 # 精确删除指定端口的 UFW 规则 (倒序删除，防止编号变动)
-# 精确删除指定端口的 UFW 规则 (显式清理全网规则 + 倒序删除具体规则)
 ufw_delete_port_rules() {
     local port="$1"
     local proto="${2:-}"
@@ -129,7 +128,7 @@ safe_enable_ufw() {
         fi
     else
         # 仅在无管理会话 IP 且没有任何该端口规则时，才兜底放行
-        if ! ufw status 2>/dev/null | grep -qE "$ssh_p(/tcp| )"; then
+        if ! ufw status 2>/dev/null | grep -qE "^$ssh_p/tcp[[:space:]]"; then
             ufw allow "$ssh_p/tcp" comment 'SSH-safety' >/dev/null 2>&1 || true
         fi
     fi
@@ -167,8 +166,40 @@ EOF
 
 save_iptables_rules() {
     mkdir -p /etc/iptables
-    iptables-save > /etc/iptables/rules.v4
-    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+
+    # 判断 UFW 是否激活：如果激活，我们只保存 NAT 和 FORWARD 链，避免干扰 UFW 管理的 INPUT 规则
+    local ufw_active=false
+    if ufw_available && ufw status | grep -q "active"; then
+        ufw_active=true
+    fi
+
+    if [ "$ufw_active" = true ]; then
+        # 只保存 NAT 表全部规则和 filter 表的 FORWARD 链
+        iptables-save -t nat > /etc/iptables/rules.v4
+        echo "*filter" > /etc/iptables/rules.v4.tmp
+        # 保存实际 FORWARD 默认策略，避免意外修改
+        local fwd_policy=$(iptables -S FORWARD | head -1 | awk '{print $2}')
+        echo ":FORWARD ${fwd_policy:-ACCEPT} [0:0]" >> /etc/iptables/rules.v4.tmp
+        iptables -S FORWARD >> /etc/iptables/rules.v4.tmp
+        echo "COMMIT" >> /etc/iptables/rules.v4.tmp
+        cat /etc/iptables/rules.v4.tmp >> /etc/iptables/rules.v4
+        rm -f /etc/iptables/rules.v4.tmp
+
+        # IPv6 同理（若有）
+        ip6tables-save -t nat > /etc/iptables/rules.v6 2>/dev/null || true
+        echo "*filter" > /etc/iptables/rules.v6.tmp
+        local fwd_policy6=$(ip6tables -S FORWARD 2>/dev/null | head -1 | awk '{print $2}')
+        echo ":FORWARD ${fwd_policy6:-ACCEPT} [0:0]" >> /etc/iptables/rules.v6.tmp
+        ip6tables -S FORWARD >> /etc/iptables/rules.v6.tmp 2>/dev/null || true
+        echo "COMMIT" >> /etc/iptables/rules.v6.tmp
+        cat /etc/iptables/rules.v6.tmp >> /etc/iptables/rules.v6 2>/dev/null || true
+        rm -f /etc/iptables/rules.v6.tmp
+    else
+        # 无 UFW 时，全量保存（INPUT 等规则由脚本直接管理）
+        iptables-save > /etc/iptables/rules.v4
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    fi
+
     ensure_persistence_service
     systemctl restart vps-iptables-rules.service 2>/dev/null || true
 }
@@ -205,12 +236,28 @@ hardening() {
     (
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq 2>/dev/null || apt-get update
-        apt-get install -y ca-certificates curl wget git htop net-tools traceroute ufw fail2ban earlyoom unattended-upgrades python3-systemd
+        # 更新失败不中断脚本
+        apt-get update -qq 2>/dev/null || apt-get update || true
 
+        # 分开安装基础工具包，避免单个包名错误导致整个流程中断
+        for pkg in ca-certificates curl wget git htop net-tools traceroute ufw fail2ban unattended-upgrades; do
+            apt-get install -y "$pkg" >/dev/null 2>&1 || echo -e "${YELLOW}警告: 安装 $pkg 失败，继续执行...${NC}"
+        done
+
+        # 可选包 earlyoom 和 python3-systemd 可能存在缺失，单独处理
+        apt-get install -y earlyoom >/dev/null 2>&1 || echo -e "${YELLOW}警告: earlyoom 安装失败或不存在，跳过。${NC}"
+        apt-get install -y python3-systemd >/dev/null 2>&1 || echo -e "${YELLOW}警告: python3-systemd 安装失败或不存在，跳过。${NC}"
+
+        # 询问是否安装最新内核（可能需要重启）
         ARCH=$(dpkg --print-architecture)
         if [ "$ARCH" = "amd64" ] || [ "$ARCH" = "arm64" ]; then
-            apt-get install -y "linux-image-$ARCH" || true
+            echo -e "${YELLOW}是否安装与当前架构匹配的 Linux 内核？(可能导致重启，建议在维护窗口执行) [y/N]${NC}"
+            # 关键修复：初始化变量防止 set -u 报错
+            local install_kernel=""
+            read -r -t 10 install_kernel || true
+            if [[ "$install_kernel" =~ ^[Yy]$ ]]; then
+                apt-get install -y "linux-image-$ARCH" || true
+            fi
         fi
 
         mkdir -p /root/.ssh && chmod 700 /root/.ssh
@@ -531,19 +578,40 @@ open_ports() {
             return 0
         fi
     fi
+
     echo -e "请输入要全局开放的本地服务端口（空格分隔，例如 80 443）："
     read -r PORTS
     if [ -z "$PORTS" ]; then
         echo -e "${RED}未输入端口，操作取消。${NC}"
         return 1
     fi
+
+    echo -e "请选择协议: ${CYAN}1) TCP  2) UDP  3) 两者${NC} (默认 1):"
+    read -r proto_opt
+    case "${proto_opt:-1}" in
+        1) proto="tcp" ;;
+        2) proto="udp" ;;
+        3) proto="both" ;;
+        *) proto="tcp" ;;
+    esac
+
     for p in $PORTS; do
         if validate_port "$p"; then
-            if ! ufw status | grep -q "ALLOW.*$p/tcp"; then
-                ufw allow "$p/tcp" comment "open-$p" || true
-                echo "已开放 TCP 端口 $p"
-            else
-                echo "端口 $p 已处于开放状态，跳过"
+            if [ "$proto" = "tcp" ] || [ "$proto" = "both" ]; then
+                if ! ufw status | grep -q "ALLOW.*$p/tcp"; then
+                    ufw allow "$p/tcp" comment "open-$p-tcp" || true
+                    echo "已开放 TCP 端口 $p"
+                else
+                    echo "TCP 端口 $p 已处于开放状态，跳过"
+                fi
+            fi
+            if [ "$proto" = "udp" ] || [ "$proto" = "both" ]; then
+                if ! ufw status | grep -q "ALLOW.*$p/udp"; then
+                    ufw allow "$p/udp" comment "open-$p-udp" || true
+                    echo "已开放 UDP 端口 $p"
+                else
+                    echo "UDP 端口 $p 已处于开放状态，跳过"
+                fi
             fi
         else
             echo "无效端口: $p，已跳过"
@@ -628,9 +696,10 @@ precheck_relay() {
         fi
     fi
 
-    # 确保原生 iptables FORWARD 链默认放行已建立连接
-    iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-    iptables -I FORWARD 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    # 确保原生 iptables FORWARD 链默认放行已建立连接（只在不存在时插入）
+    if ! iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
+        iptables -I FORWARD 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    fi
 
     ensure_persistence_service
     echo -e "${GREEN}===== 预检查完成 =====${NC}"
@@ -697,7 +766,7 @@ configure_relay() {
         A_PORT="${mapping%%:*}"
         B_PORT="${mapping##*:}"
 
-        # 1. 倒序深度清理该 A_PORT 上所有的旧 PREROUTING 规则 (避免编号位移导致残留)
+        # 1. 倒序深度清理该 A_PORT 上所有的旧 PREROUTING 规则
         local existing_rules
         existing_rules=$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | grep -E "dpt:$A_PORT( |$)" | awk '{print $1}' | grep -E '^[0-9]+$' | sort -rn || true)
         if [ -n "$existing_rules" ]; then
@@ -734,22 +803,21 @@ check_relay_success() {
     local mappings=("$@")
     echo -e "${YELLOW}===== 验证中转规则生效情况 =====${NC}"
 
-    local nat_rules
-    nat_rules=$(iptables-save -t nat)
     local all_ok=true
 
     for mapping in "${mappings[@]}"; do
         local A_PORT="${mapping%%:*}"
         local B_PORT="${mapping##*:}"
 
-        if echo "$nat_rules" | grep -qE -- "-A PREROUTING -p $PROTO -m $PROTO --dport $A_PORT -j DNAT --to-destination $B_IP(:$B_PORT)?"; then
+        # 使用 iptables -C 直接检测规则是否存在
+        if iptables -t nat -C PREROUTING -p "$PROTO" --dport "$A_PORT" -j DNAT --to-destination "$B_IP:$B_PORT" 2>/dev/null; then
             echo -e "${GREEN}[通过] PREROUTING 规则正常: $A_PORT -> $B_IP:$B_PORT${NC}"
         else
             echo -e "${RED}[失败] PREROUTING 规则缺失: $A_PORT${NC}"
             all_ok=false
         fi
 
-        if echo "$nat_rules" | grep -qE -- "-A POSTROUTING -d $B_IP(/32)? -p $PROTO -m $PROTO --dport $B_PORT -j MASQUERADE"; then
+        if iptables -t nat -C POSTROUTING -p "$PROTO" -d "$B_IP" --dport "$B_PORT" -j MASQUERADE 2>/dev/null; then
             echo -e "${GREEN}[通过] POSTROUTING MASQUERADE 正常${NC}"
         else
             echo -e "${RED}[失败] POSTROUTING MASQUERADE 缺失${NC}"
@@ -814,7 +882,6 @@ check_forwarding_effectiveness() {
             continue
         fi
 
-        # 解决 set -u 下变量后接标点导致解析崩溃的问题
         if timeout 3 bash -c "echo > /dev/tcp/${b_ip}/${b_port}" 2>/dev/null; then
             echo -e "${GREEN}[通过] 到目标 ${b_ip}:${b_port} 的网络握手成功${NC}"
         elif command -v nc >/dev/null 2>&1 && nc -z -w 3 "$b_ip" "$b_port" >/dev/null 2>&1; then
@@ -935,12 +1002,19 @@ configure_landing() {
 
     if ufw_available && ufw status | grep -q "active"; then
         for p in "${valid_ports[@]}"; do
-            # 如果该业务端口此前存在全网放行 (Anywhere)，清理之以防止穿透击穿落地源站隐身
-            if ufw status 2>/dev/null | grep -E "^\[ *[0-9]+\] +$p(/$PROTO| ) " | grep -q "Anywhere"; then
+            # 检查并清除该端口的全网放行规则 (Anywhere)，防止穿透
+            local anywhere_rules
+            anywhere_rules=$(ufw status numbered | awk -v port="$p" -v proto="$PROTO" '
+                $0 ~ /Anywhere/ && $0 ~ port && ($0 ~ proto || proto=="tcp" && $0 ~ port"/tcp") {print $2}
+            ' | tr -d '[]' | sort -rn)
+            if [ -n "$anywhere_rules" ]; then
                 echo -e "${YELLOW}[检测] 业务端口 $p 存在全网放行 (Anywhere)，正在清理以保障仅中转机可达...${NC}"
-                ufw delete allow "$p/$PROTO" >/dev/null 2>&1 || true
-                ufw delete allow "$p" >/dev/null 2>&1 || true
+                for r in $anywhere_rules; do
+                    ufw --force delete "$r" >/dev/null 2>&1 || true
+                done
             fi
+
+            # 添加仅允许中转机访问的规则
             if ! ufw status | grep -qE "ALLOW.*$RELAY_IP.*$p/$PROTO"; then
                 ufw allow from "$RELAY_IP" to any port "$p" proto "$PROTO" comment "from-relay-$RELAY_IP" || true
                 echo "UFW 已放行: $p/$PROTO 仅限来自 $RELAY_IP"
@@ -1110,6 +1184,334 @@ network_tuning_menu() {
 }
 
 # ============================================================
+# 模块五：配置备份与灾备恢复
+# ============================================================
+
+BACKUP_DIR="/var/backups/vps-manager"
+
+backup_config() {
+    echo -e "${YELLOW}===== 创建当前系统与网络配置备份 =====${NC}"
+    mkdir -p "$BACKUP_DIR"
+
+    local note=""
+    read -rp "请输入备份备注 (可选，直接回车跳过): " note
+
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local tmp_dir="/tmp/vps_backup_${timestamp}"
+    mkdir -p "$tmp_dir"
+
+    echo -e "${YELLOW}正在收集各项关键配置...${NC}"
+
+    # 1. SSH 配置
+    if [ -d /etc/ssh ]; then
+        mkdir -p "$tmp_dir/etc/ssh"
+        [ -f /etc/ssh/sshd_config ] && cp -a /etc/ssh/sshd_config "$tmp_dir/etc/ssh/"
+        [ -d /etc/ssh/sshd_config.d ] && cp -a /etc/ssh/sshd_config.d "$tmp_dir/etc/ssh/"
+    fi
+    if [ -f /root/.ssh/authorized_keys ]; then
+        mkdir -p "$tmp_dir/root/.ssh"
+        cp -a /root/.ssh/authorized_keys "$tmp_dir/root/.ssh/"
+    fi
+
+    # 2. UFW 防火墙配置
+    if [ -d /etc/ufw ]; then
+        mkdir -p "$tmp_dir/etc/ufw"
+        cp -a /etc/ufw/* "$tmp_dir/etc/ufw/" 2>/dev/null || true
+    fi
+    if [ -f /etc/default/ufw ]; then
+        mkdir -p "$tmp_dir/etc/default"
+        cp -a /etc/default/ufw "$tmp_dir/etc/default/"
+    fi
+
+    # 3. iptables / NAT / 转发规则与持久化服务
+    if [ -d /etc/iptables ]; then
+        mkdir -p "$tmp_dir/etc/iptables"
+        cp -a /etc/iptables/* "$tmp_dir/etc/iptables/" 2>/dev/null || true
+    fi
+    if [ -f /etc/systemd/system/vps-iptables-rules.service ]; then
+        mkdir -p "$tmp_dir/etc/systemd/system"
+        cp -a /etc/systemd/system/vps-iptables-rules.service "$tmp_dir/etc/systemd/system/"
+    fi
+    mkdir -p "$tmp_dir/runtime_rules"
+    iptables-save > "$tmp_dir/runtime_rules/iptables.rules" 2>/dev/null || true
+    ip6tables-save > "$tmp_dir/runtime_rules/ip6tables.rules" 2>/dev/null || true
+
+    # 4. 内核与系统参数
+    mkdir -p "$tmp_dir/etc"
+    [ -f /etc/sysctl.conf ] && cp -a /etc/sysctl.conf "$tmp_dir/etc/"
+    if [ -d /etc/sysctl.d ]; then
+        mkdir -p "$tmp_dir/etc/sysctl.d"
+        cp -a /etc/sysctl.d/* "$tmp_dir/etc/sysctl.d/" 2>/dev/null || true
+    fi
+    [ -f /etc/security/limits.conf ] && mkdir -p "$tmp_dir/etc/security" && cp -a /etc/security/limits.conf "$tmp_dir/etc/security/" 2>/dev/null || true
+    [ -f /etc/fail2ban/jail.local ] && mkdir -p "$tmp_dir/etc/fail2ban" && cp -a /etc/fail2ban/jail.local "$tmp_dir/etc/fail2ban/" 2>/dev/null || true
+
+    # 5. 生成备份元数据 (METADATA)
+    local ssh_p ufw_st dnat_cnt
+    ssh_p=$(get_ssh_port)
+    ufw_st="未安装"
+    if ufw_available; then
+        ufw status | grep -q "active" && ufw_st="active" || ufw_st="inactive"
+    fi
+    dnat_cnt=$(iptables-save -t nat 2>/dev/null | grep -- "-A PREROUTING .* -j DNAT" | wc -l)
+
+    cat > "$tmp_dir/META.info" <<EOF
+BACKUP_TIME="$timestamp"
+NOTE="${note:-无备注}"
+SSH_PORT="$ssh_p"
+UFW_STATUS="$ufw_st"
+DNAT_COUNT="$dnat_cnt"
+KERNEL="$(uname -r)"
+EOF
+
+    local archive_name="backup_${timestamp}.tar.gz"
+    local target_file="${BACKUP_DIR}/${archive_name}"
+
+    if tar -czf "$target_file" -C "$tmp_dir" .; then
+        rm -rf "$tmp_dir"
+        local file_size
+        file_size=$(du -h "$target_file" 2>/dev/null | awk '{print $1}')
+        echo -e "${GREEN}===== 备份创建成功 =====${NC}"
+        echo -e "  备份文件: ${CYAN}${target_file}${NC} (${file_size})"
+        echo -e "  备份时间: ${timestamp}"
+        echo -e "  SSH 端口: ${ssh_p}"
+        echo -e "  UFW 状态: ${ufw_st}"
+        echo -e "  中转规则: ${dnat_cnt} 条"
+        [ -n "$note" ] && echo -e "  备份备注: ${note}"
+    else
+        rm -rf "$tmp_dir"
+        echo -e "${RED}备份创建失败（可能磁盘空间不足），请检查后重试。${NC}"
+        return 1
+    fi
+}
+
+restore_config() {
+    echo -e "${YELLOW}===== 查看与回退/还原历史备份配置 =====${NC}"
+    mkdir -p "$BACKUP_DIR"
+
+    local backups=()
+    while IFS= read -r f; do
+        [ -f "$f" ] && backups+=("$f")
+    done < <(find "$BACKUP_DIR" -maxdepth 1 \( -name "backup_*.tar.gz" -o -name "pre_restore_*.tar.gz" \) 2>/dev/null | sort -r)
+
+    if [ ${#backups[@]} -eq 0 ]; then
+        echo -e "${YELLOW}未发现任何历史备份文件（备份目录: $BACKUP_DIR）。${NC}"
+        return 0
+    fi
+
+    echo -e "发现以下备份列表 (按时间由近到远):"
+    echo -e "----------------------------------------------------------------------"
+    printf "  %-4s %-20s %-8s %-9s %-8s %s\n" "序号" "备份时间" "SSH端口" "UFW状态" "大小" "备注"
+    echo -e "----------------------------------------------------------------------"
+
+    local i=1
+    for b in "${backups[@]}"; do
+        local b_name
+        b_name=$(basename "$b")
+        local b_time b_note b_ssh b_ufw b_size
+        b_size=$(du -h "$b" 2>/dev/null | awk '{print $1}')
+
+        local meta_content
+        meta_content=$(tar -zxOf "$b" ./META.info 2>/dev/null || tar -zxOf "$b" META.info 2>/dev/null || true)
+        if [ -n "$meta_content" ]; then
+            b_time=$(echo "$meta_content" | awk -F'=' '/^BACKUP_TIME=/{gsub(/"/, "", $2); print $2}')
+            b_note=$(echo "$meta_content" | awk -F'=' '/^NOTE=/{gsub(/"/, "", $2); print $2}')
+            b_ssh=$(echo "$meta_content" | awk -F'=' '/^SSH_PORT=/{gsub(/"/, "", $2); print $2}')
+            b_ufw=$(echo "$meta_content" | awk -F'=' '/^UFW_STATUS=/{gsub(/"/, "", $2); print $2}')
+        else
+            b_time="${b_name%.tar.gz}"
+            b_note="基础备份"
+            b_ssh="未知"
+            b_ufw="未知"
+        fi
+        printf "  [%-2d] %-20s %-8s %-9s %-8s %s\n" "$i" "$b_time" "${b_ssh:-未知}" "${b_ufw:-未知}" "$b_size" "${b_note:-无备注}"
+        i=$((i + 1))
+    done
+    echo -e "----------------------------------------------------------------------"
+    echo -e "  输入序号回退对应备份，或输入 ${CYAN}del <序号>${NC} 删除指定备份，或输入 0 取消"
+
+    read -rp "请输入操作指令: " action
+    if [ -z "$action" ] || [ "$action" = "0" ]; then
+        echo "操作已取消。"
+        return 0
+    fi
+
+    if [[ "$action" =~ ^del[[:space:]]+([0-9]+)$ ]]; then
+        local del_idx="${BASH_REMATCH[1]}"
+        if (( del_idx >= 1 && del_idx <= ${#backups[@]} )); then
+            local target_del="${backups[$((del_idx - 1))]}"
+            read -rp "确认永久删除备份 $(basename "$target_del")？(y/N): " del_confirm
+            if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
+                rm -f "$target_del"
+                echo -e "${GREEN}已删除备份: $(basename "$target_del")${NC}"
+            else
+                echo "取消删除。"
+            fi
+        else
+            echo -e "${RED}无效序号: $del_idx${NC}"
+        fi
+        return 0
+    fi
+
+    if ! [[ "$action" =~ ^[0-9]+$ ]] || (( action < 1 || action > ${#backups[@]} )); then
+        echo -e "${RED}无效选择: $action${NC}"
+        return 1
+    fi
+
+    local selected_backup="${backups[$((action - 1))]}"
+    echo -e "${YELLOW}您选择了备份: $(basename "$selected_backup")${NC}"
+    echo -e "${RED}[高危警告] 回退将覆盖当前的 SSH、防火墙(UFW)、iptables中转、sysctl 等配置！${NC}"
+    echo -e "${YELLOW}系统将在回退前自动对当前环境制作【紧急快照 (pre_restore)】，随时可反悔撤销。${NC}"
+    read -rp "确认开始回退并应用该备份？(y/N): " confirm_restore
+    if [[ ! "$confirm_restore" =~ ^[Yy]$ ]]; then
+        echo "已取消回退。"
+        return 0
+    fi
+
+    # 1. 自动为当前状态创建安全快照防失联
+    echo -e "${YELLOW}正在为当前状态创建安全快照...${NC}"
+    local snap_time
+    snap_time=$(date +%Y%m%d_%H%M%S)
+    local snap_file="${BACKUP_DIR}/pre_restore_${snap_time}.tar.gz"
+    local snap_tmp="/tmp/vps_snap_${snap_time}"
+    mkdir -p "$snap_tmp"
+
+    [ -d /etc/ssh ] && mkdir -p "$snap_tmp/etc" && cp -a /etc/ssh "$snap_tmp/etc/"
+    [ -f /root/.ssh/authorized_keys ] && mkdir -p "$snap_tmp/root/.ssh" && cp -a /root/.ssh/authorized_keys "$snap_tmp/root/.ssh/"
+    [ -d /etc/ufw ] && mkdir -p "$snap_tmp/etc" && cp -a /etc/ufw "$snap_tmp/etc/"
+    [ -f /etc/default/ufw ] && mkdir -p "$snap_tmp/etc/default" && cp -a /etc/default/ufw "$snap_tmp/etc/default/"
+    [ -d /etc/iptables ] && mkdir -p "$snap_tmp/etc" && cp -a /etc/iptables "$snap_tmp/etc/"
+    [ -f /etc/systemd/system/vps-iptables-rules.service ] && mkdir -p "$snap_tmp/etc/systemd/system" && cp -a /etc/systemd/system/vps-iptables-rules.service "$snap_tmp/etc/systemd/system/"
+    [ -f /etc/sysctl.conf ] && mkdir -p "$snap_tmp/etc" && cp -a /etc/sysctl.conf "$snap_tmp/etc/"
+    [ -d /etc/sysctl.d ] && mkdir -p "$snap_tmp/etc" && cp -a /etc/sysctl.d "$snap_tmp/etc/"
+    mkdir -p "$snap_tmp/runtime_rules"
+    iptables-save > "$snap_tmp/runtime_rules/iptables.rules" 2>/dev/null || true
+    ip6tables-save > "$snap_tmp/runtime_rules/ip6tables.rules" 2>/dev/null || true
+
+    local cur_ssh_p cur_ufw_st cur_dnat_cnt
+    cur_ssh_p=$(get_ssh_port)
+    cur_ufw_st="未安装"
+    if ufw_available; then
+        ufw status | grep -q "active" && cur_ufw_st="active" || cur_ufw_st="inactive"
+    fi
+    cur_dnat_cnt=$(iptables-save -t nat 2>/dev/null | grep -- "-A PREROUTING .* -j DNAT" | wc -l)
+
+    cat > "$snap_tmp/META.info" <<EOF
+BACKUP_TIME="$snap_time"
+NOTE="回退前自动保存快照 (Auto Pre-Restore)"
+SSH_PORT="$cur_ssh_p"
+UFW_STATUS="$cur_ufw_st"
+DNAT_COUNT="$cur_dnat_cnt"
+KERNEL="$(uname -r)"
+EOF
+
+    if ! tar -czf "$snap_file" -C "$snap_tmp" .; then
+        echo -e "${RED}[严重错误] 创建安全快照失败，还原操作中止以避免无法回滚。${NC}"
+        rm -rf "$snap_tmp"
+        return 1
+    fi
+    rm -rf "$snap_tmp"
+    echo -e "${GREEN}当前环境快照已保存至: $(basename "$snap_file")${NC}"
+
+    # 2. 解压待恢复的备份到临时目录
+    local restore_tmp="/tmp/vps_restore_work"
+    rm -rf "$restore_tmp"
+    mkdir -p "$restore_tmp"
+    if ! tar -zxf "$selected_backup" -C "$restore_tmp"; then
+        echo -e "${RED}[严重错误] 解压备份文件失败，还原操作中止。${NC}"
+        rm -rf "$restore_tmp"
+        return 1
+    fi
+
+    # 3. 校验 SSH 配置语法
+    if [ -f "$restore_tmp/etc/ssh/sshd_config" ]; then
+        echo -e "${YELLOW}正在校验待恢复的 SSH 配置合法性...${NC}"
+        if ! /usr/sbin/sshd -t -f "$restore_tmp/etc/ssh/sshd_config" 2>/dev/null; then
+            echo -e "${RED}[严重错误] 备份中的 SSH 配置校验未通过，中止还原以防止失联！${NC}"
+            rm -rf "$restore_tmp"
+            return 1
+        fi
+    fi
+
+    # 4. 落地恢复配置
+    echo -e "${YELLOW}正在还原配置文件...${NC}"
+
+    # 4.1 恢复 SSH
+    if [ -f "$restore_tmp/etc/ssh/sshd_config" ]; then
+        cp -a "$restore_tmp/etc/ssh/sshd_config" /etc/ssh/
+    fi
+    if [ -d "$restore_tmp/etc/ssh/sshd_config.d" ]; then
+        mkdir -p /etc/ssh/sshd_config.d
+        cp -a "$restore_tmp/etc/ssh/sshd_config.d/"* /etc/ssh/sshd_config.d/ 2>/dev/null || true
+    fi
+    if [ -f "$restore_tmp/root/.ssh/authorized_keys" ]; then
+        mkdir -p /root/.ssh && chmod 700 /root/.ssh
+        cp -a "$restore_tmp/root/.ssh/authorized_keys" /root/.ssh/
+        chmod 600 /root/.ssh/authorized_keys
+    fi
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+
+    # 4.2 恢复 UFW
+    if [ -d "$restore_tmp/etc/ufw" ]; then
+        mkdir -p /etc/ufw
+        cp -a "$restore_tmp/etc/ufw/"* /etc/ufw/ 2>/dev/null || true
+    fi
+    if [ -f "$restore_tmp/etc/default/ufw" ]; then
+        cp -a "$restore_tmp/etc/default/ufw" /etc/default/
+    fi
+    if ufw_available; then
+        ufw reload >/dev/null 2>&1 || true
+    fi
+
+    # 4.3 恢复 iptables / 转发持久化
+    if [ -d "$restore_tmp/etc/iptables" ]; then
+        mkdir -p /etc/iptables
+        cp -a "$restore_tmp/etc/iptables/"* /etc/iptables/ 2>/dev/null || true
+    fi
+    if [ -f "$restore_tmp/etc/systemd/system/vps-iptables-rules.service" ]; then
+        cp -a "$restore_tmp/etc/systemd/system/vps-iptables-rules.service" /etc/systemd/system/
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable vps-iptables-rules.service 2>/dev/null || true
+    fi
+    if [ -f /etc/iptables/rules.v4 ]; then
+        iptables-restore -n /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+    if [ -f /etc/iptables/rules.v6 ]; then
+        ip6tables-restore -n /etc/iptables/rules.v6 2>/dev/null || true
+    fi
+
+    # 4.4 恢复内核与系统参数
+    if [ -f "$restore_tmp/etc/sysctl.conf" ]; then
+        cp -a "$restore_tmp/etc/sysctl.conf" /etc/
+    fi
+    if [ -d "$restore_tmp/etc/sysctl.d" ]; then
+        mkdir -p /etc/sysctl.d
+        cp -a "$restore_tmp/etc/sysctl.d/"* /etc/sysctl.d/ 2>/dev/null || true
+    fi
+    sysctl --system >/dev/null 2>&1 || true
+
+    # 4.5 恢复 Fail2ban
+    if [ -f "$restore_tmp/etc/fail2ban/jail.local" ]; then
+        mkdir -p /etc/fail2ban
+        cp -a "$restore_tmp/etc/fail2ban/jail.local" /etc/fail2ban/
+        systemctl restart fail2ban 2>/dev/null || true
+    fi
+
+    rm -rf "$restore_tmp"
+
+    local current_port
+    current_port=$(get_ssh_port)
+    echo -e "${GREEN}============================================================${NC}"
+    echo -e "${GREEN}                 历史配置回退/还原完成！                   ${NC}"
+    echo -e "${GREEN}============================================================${NC}"
+    echo -e "  当前已生效 SSH 端口: ${CYAN}${current_port}${NC}"
+    echo -e "  当前已生效 UFW 状态: $(ufw status 2>/dev/null | grep -q 'active' && echo -e "${GREEN}active${NC}" || echo -e "${YELLOW}inactive${NC}")"
+    echo -e "  当前中转 PREROUTING 规则数: $(iptables-save -t nat 2>/dev/null | grep -- '-A PREROUTING .* -j DNAT' | wc -l)"
+    echo -e "${YELLOW}注意：请在当前会话保持连接，另开新终端测试登录：ssh -p $current_port root@<IP>${NC}"
+}
+
+# ============================================================
 # 主菜单
 # ============================================================
 
@@ -1137,6 +1539,10 @@ while true; do
     echo -e ""
     echo -e "  ${CYAN}【系统与网络优化】${NC}"
     echo -e "  12. BBR 拥塞控制与网络深度调优 (集成 tcpfit)"
+    echo -e ""
+    echo -e "  ${CYAN}【配置备份与灾备】${NC}"
+    echo -e "  13. 创建当前系统配置备份 (包含SSH/UFW/中转/内核参数)"
+    echo -e "  14. 查看并回退/还原历史备份配置"
     echo -e "  0.  退出脚本"
     echo -e "${BLUE}============================================================${NC}"
     echo -ne "请输入数字选择操作: "
@@ -1157,6 +1563,8 @@ while true; do
         10) configure_landing ;;
         11) delete_landing_whitelist ;;
         12) network_tuning_menu ;;
+        13) backup_config ;;
+        14) restore_config ;;
         0) echo -e "${GREEN}退出脚本。${NC}"; exit 0 ;;
         *) echo -e "${RED}无效选择，请重新输入。${NC}"; sleep 1; continue ;;
     esac
