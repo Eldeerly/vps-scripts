@@ -27,6 +27,9 @@ if ! command -v apt-get >/dev/null 2>&1; then
     exit 1
 fi
 
+# 获取脚本自身的绝对路径（用于快捷安装）
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "")"
+
 # ============================================================
 # 通用校验与辅助工具函数
 # ============================================================
@@ -1579,6 +1582,43 @@ EOF
 }
 
 # ============================================================
+# 模块六：快捷命令安装 (vps)
+# ============================================================
+
+install_shortcut() {
+    echo -e "${YELLOW}===== 安装/更新 vps 快捷命令 =====${NC}"
+    
+    if [ -z "$SCRIPT_PATH" ] || [ ! -f "$SCRIPT_PATH" ]; then
+        echo -e "${RED}错误：无法定位当前脚本文件，可能通过管道执行。请先保存脚本到本地文件后再执行本功能。${NC}"
+        return 1
+    fi
+
+    local target="/usr/local/bin/vps"
+    if [ ! -d /usr/local/bin ]; then
+        mkdir -p /usr/local/bin
+    fi
+
+    # 复制脚本到目标位置
+    if cp "$SCRIPT_PATH" "$target"; then
+        chmod +x "$target"
+        echo -e "${GREEN}[成功] 已将脚本安装到 ${target}${NC}"
+        echo -e "现在您可以直接在终端输入 ${CYAN}vps${NC} 启动本管理脚本。"
+    else
+        echo -e "${RED}[失败] 复制文件到 ${target} 失败，请检查权限。${NC}"
+        return 1
+    fi
+}
+
+# ============================================================
+# 自动安装快捷命令（如果当前脚本不是已安装的快捷命令）
+# ============================================================
+
+if [ "$SCRIPT_PATH" != "/usr/local/bin/vps" ]; then
+    install_shortcut
+    exit $?
+fi
+
+# ============================================================
 # 主菜单
 # ============================================================
 
@@ -1612,6 +1652,9 @@ while true; do
     echo -e "  ${CYAN}【配置备份与灾备】${NC}"
     echo -e "  15. 创建当前系统配置备份 (包含SSH/UFW/中转/内核参数)"
     echo -e "  16. 查看并回退/还原历史备份配置"
+    echo -e ""
+    echo -e "  ${CYAN}【系统工具】${NC}"
+    echo -e "  17. 安装/更新 vps 快捷命令"
     echo -e "  0.  退出脚本"
     echo -e "${BLUE}============================================================${NC}"
     echo -ne "请输入数字选择操作: "
@@ -1636,6 +1679,7 @@ while true; do
         14) network_tuning_menu ;;
         15) backup_config ;;
         16) restore_config ;;
+        17) install_shortcut ;;
         0) echo -e "${GREEN}退出脚本。${NC}"; exit 0 ;;
         *) echo -e "${RED}无效选择，请重新输入。${NC}"; sleep 1; continue ;;
     esac
